@@ -62,7 +62,35 @@ class Weather {
 }
 
 // ============================================================================
-// 2. HELPER FUNCTIONS
+// 2. BULLETPROOF STORAGE SERVICE (SharedPreferences + In-Memory Fallback)
+// ============================================================================
+class StorageService {
+  static final Map<String, String> _memory = {};
+
+  static Future<void> setString(String key, String value) async {
+    _memory[key] = value;
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(milliseconds: 1200));
+      await prefs.setString(key, value);
+    } catch (_) {
+      // In-memory fallback handles DartPad sandbox limitations seamlessly
+    }
+  }
+
+  static Future<String?> getString(String key) async {
+    try {
+      final prefs = await SharedPreferences.getInstance()
+          .timeout(const Duration(milliseconds: 1200));
+      final val = prefs.getString(key);
+      if (val != null) return val;
+    } catch (_) {}
+    return _memory[key];
+  }
+}
+
+// ============================================================================
+// 3. HELPER FUNCTIONS & API REQUEST
 // ============================================================================
 String describe(int code) {
   if (code == 0) return 'Clear sky';
@@ -93,7 +121,7 @@ Future<Weather> fetchWeather(City city) async {
     '&timezone=Africa%2FKigali',
   );
 
-  final response = await http.get(url);
+  final response = await http.get(url).timeout(const Duration(seconds: 6));
   if (response.statusCode != 200) {
     throw Exception('The weather server answered ${response.statusCode}');
   }
@@ -103,7 +131,7 @@ Future<Weather> fetchWeather(City city) async {
 }
 
 // ============================================================================
-// 3. MAIN APP WIDGET
+// 4. MAIN APP WIDGET
 // ============================================================================
 class WeatherApp extends StatelessWidget {
   const WeatherApp({super.key});
@@ -116,7 +144,7 @@ class WeatherApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF0468D7), // Kigali blue
+          seedColor: const Color(0xFF0468D7),
           primary: const Color(0xFF0468D7),
           surface: Colors.grey[50],
         ),
@@ -132,7 +160,7 @@ class WeatherApp extends StatelessWidget {
 }
 
 // ============================================================================
-// 4. WEATHER SCREEN (STATEFUL)
+// 5. WEATHER SCREEN (STATEFUL)
 // ============================================================================
 class WeatherScreen extends StatefulWidget {
   const WeatherScreen({super.key});
@@ -154,24 +182,24 @@ class _WeatherScreenState extends State<WeatherScreen> {
   @override
   void initState() {
     super.initState();
-    start();
+    initAndLoad();
   }
 
-  /// Startup: loads the saved city name first, then fetches weather
-  Future<void> start() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedCityName = prefs.getString('city');
-    if (savedCityName != null) {
-      final matching = cities.where((c) => c.name == savedCityName);
-      if (matching.isNotEmpty) {
-        city = matching.first;
+  Future<void> initAndLoad() async {
+    try {
+      final savedCityName = await StorageService.getString('city');
+      if (savedCityName != null) {
+        final matching = cities.where((c) => c.name == savedCityName);
+        if (matching.isNotEmpty) {
+          city = matching.first;
+        }
       }
-    }
+    } catch (_) {}
     await load();
   }
 
-  /// Loads weather: fetches from API, saves to cache, or falls back to cache on failure
   Future<void> load() async {
+    if (!mounted) return;
     setState(() {
       loading = true;
       error = null;
@@ -184,9 +212,11 @@ class _WeatherScreenState extends State<WeatherScreen> {
 
       final result = await fetchWeather(city);
 
-      // Save fresh weather into cache
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('weather_${city.name}', jsonEncode(result.toJson()));
+      // Cache fresh result
+      await StorageService.setString(
+        'weather_${city.name}',
+        jsonEncode(result.toJson()),
+      );
 
       if (!mounted) return;
       setState(() {
@@ -196,33 +226,33 @@ class _WeatherScreenState extends State<WeatherScreen> {
         offline = false;
       });
     } catch (e) {
-      // Offline fallback: check if we have cached weather for this city
-      final prefs = await SharedPreferences.getInstance();
-      final cachedJson = prefs.getString('weather_${city.name}');
+      // Offline fallback: try reading cached weather
+      Weather? cachedWeather;
+      try {
+        final cachedJson = await StorageService.getString('weather_${city.name}');
+        if (cachedJson != null) {
+          final cachedMap = jsonDecode(cachedJson) as Map<String, dynamic>;
+          cachedWeather = Weather.fromJson(cachedMap);
+        }
+      } catch (_) {}
 
       if (!mounted) return;
 
-      if (cachedJson != null) {
-        try {
-          final cachedMap = jsonDecode(cachedJson) as Map<String, dynamic>;
-          final cachedWeather = Weather.fromJson(cachedMap);
-          setState(() {
-            weather = cachedWeather;
-            loading = false;
-            error = null;
-            offline = true;
-          });
-          return;
-        } catch (_) {}
+      if (cachedWeather != null) {
+        setState(() {
+          weather = cachedWeather;
+          loading = false;
+          error = null;
+          offline = true;
+        });
+      } else {
+        setState(() {
+          weather = null;
+          loading = false;
+          offline = false;
+          error = 'Could not load the weather. Check your internet connection.';
+        });
       }
-
-      // No cached data available for this city: show error screen
-      setState(() {
-        weather = null;
-        loading = false;
-        offline = false;
-        error = 'Could not load the weather. Check your internet connection.';
-      });
     }
   }
 
@@ -234,10 +264,7 @@ class _WeatherScreenState extends State<WeatherScreen> {
       offline = false;
     });
 
-    // Save selected city name
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('city', newCity.name);
-
+    await StorageService.setString('city', newCity.name);
     await load();
   }
 
@@ -261,7 +288,6 @@ class _WeatherScreenState extends State<WeatherScreen> {
           style: const TextStyle(fontWeight: FontWeight.bold),
         ),
         actions: [
-          // Quick toggle for testing and capturing offline screenshots in DartPad
           IconButton(
             tooltip: simulateOffline ? 'Simulate Online' : 'Simulate Offline',
             icon: Icon(simulateOffline ? Icons.wifi_off : Icons.wifi),
@@ -385,7 +411,7 @@ class _WeatherScreenState extends State<WeatherScreen> {
 }
 
 // ============================================================================
-// 5. WEATHER CARD WIDGET
+// 6. WEATHER CARD WIDGET
 // ============================================================================
 class WeatherCard extends StatelessWidget {
   const WeatherCard({
@@ -416,7 +442,6 @@ class WeatherCard extends StatelessWidget {
         padding: const EdgeInsets.all(24),
         child: Column(
           children: [
-            // Top Row: City & Sky Condition Icon
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -450,8 +475,6 @@ class WeatherCard extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 24),
-
-            // Big Temperature Text
             Text(
               '${weather.temperature.round()}°C',
               style: const TextStyle(
@@ -462,12 +485,10 @@ class WeatherCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 20),
-
-            // Details Container: Humidity & Wind
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.18),
+                color: const Color(0x2EFFFFFF),
                 borderRadius: BorderRadius.circular(14),
               ),
               child: Row(
@@ -504,8 +525,6 @@ class WeatherCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
-
-            // Timestamp
             Text(
               'Updated at $formattedTime',
               style: const TextStyle(fontSize: 12, color: Colors.white70),
